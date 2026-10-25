@@ -22,9 +22,10 @@ import studio_grammar as grammar
 import compose_blueprint as composer
 import render_soundfont as renderer
 from soul_composition import make_demo_cut
+import on_demand_render as on_demand
 
 
-def build(folder):
+def build(folder, soul_style='east'):
     folder = Path(folder).resolve()
     hashes = ENGINE.hashes
     workspace = folder / 'workspace'
@@ -66,20 +67,36 @@ def build(folder):
             duration=13, notes=len(audible), candidate_notes=len(notes), symbols=len(bp['symbols']), drawn=len(art),
             voices=[dict(voice=v, label=studio.BP_BAND_LABELS[v], instrument=instruments[v], program=programs[v],
                          color=studio.BP_BAND_COLORS[v], notes=sum(n['voice'] == v for n in audible)) for v in range(5)])
-        payload['soul'] = grammar.compose_units(units, 'soul')
+        payload['soul'] = grammar.compose_units(units, 'soul', soul_style)
         from progressive_arrangement import arrange, PRESETS
         from color_dna import analyze
         color_dna = analyze(folder / 'original.png','uploaded original photograph') if (folder / 'original.png').exists() else None
         payload['color_dna'] = color_dna
         payload['progressive_engine_hashes'] = {name:hashes[name] for name in ('color_dna.py','progressive_arrangement.py','progressive_features.py')}
         strengths = ['off','soft','mid','auto','vivid'] if color_dna and color_dna['available'] else ['auto']
+        # H2: the *arrangements* are cheap (about 5 ms each), so all of
+        # them are still computed up front and stored in the manifest — the
+        # studio UI needs the note lists for the visualisation and the
+        # note inspector.  Only the *audio* is rendered on demand.
         payload['progressive_colors'] = {preset:{strength:arrange(payload['soul'],preset,units=units,color_dna=color_dna,color_strength=strength) for strength in strengths} for preset in PRESETS}
         payload['progressive_presets'] = {preset:versions['auto'] for preset,versions in payload['progressive_colors'].items()}
         payload['progressive'] = payload['progressive_presets']['nature']
         payload['soul_demo'] = make_demo_cut(payload['soul'])
+        # The classified geometry is needed to re-arrange a variant on
+        # demand.  It is removed again before the manifest is written.
+        payload['units_source'] = units
+        # H2: which Progressive audio has actually been rendered.  The
+        # studio UI asks the server for the missing ones.
+        payload['rendered_variants'] = []
         tracks = [('soul', 'soul', payload['soul']), ('soul_demo', 'soul-demo', payload['soul_demo'])]
-        tracks += [('progressive', 'progressive'+('' if preset=='nature' else '-'+preset)+('' if strength=='auto' else '-color-'+strength), music)
-                   for preset,versions in payload['progressive_colors'].items() for strength,music in versions.items()]
+        # H2: only the default Progressive combination is rendered now.
+        # Every other combination is rendered on demand through
+        # `/api/jobs/<id>/progressive?preset=&strength=` (see
+        # `on_demand_render.py`).
+        default_preset = on_demand.DEFAULT_PRESET
+        default_strength = on_demand.DEFAULT_STRENGTH
+        default_music = payload['progressive_colors'][default_preset][default_strength]
+        tracks.append(('progressive', on_demand.variant_prefix(default_preset, default_strength), default_music))
         for key, prefix, music in tracks:
             for v in range(5):
                 renderer.render_wav([n for n in music['notes'] if n['voice'] == v], assets / f'{slug}-{prefix}-{v}.wav',
@@ -88,6 +105,7 @@ def build(folder):
             if key == 'progressive':
                 from build_progressive_arrangement import mix_stems
                 mix_stems(f'{slug}-{prefix}', music, assets)
+                payload['rendered_variants'] = [[default_preset, default_strength]]
             if key != 'progressive':
                 studio.export_spatial_mix(f'{slug}-{prefix}', music)
         if color_dna and color_dna['available']:
@@ -95,6 +113,10 @@ def build(folder):
             build_living_color(payload,units,folder/'original.png',assets,pool,sf)
     finally:
         pool.close()
+    # `units_source` is only needed while the workspace is being built; it
+    # must not end up in the manifest (it is large and not part of the
+    # public contract).
+    payload.pop('units_source', None)
     for name, content in ENGINE.content.items():
         file = Path(name)
         if file.parent == Path('ui') and file.suffix in ('.html', '.css', '.js'):
@@ -120,4 +142,7 @@ def build(folder):
 
 
 if __name__ == '__main__':
-    build(sys.argv[1])
+    # M8: the harmony style is selectable (`east` / `west`).  It is passed
+    # on the command line so that the intake server can choose it through
+    # `config.local.json` without changing the engine.
+    build(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else 'east')

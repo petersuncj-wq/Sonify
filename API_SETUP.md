@@ -61,7 +61,7 @@ notepad photo\intake\config.local.json
 在 PowerShell 里按 **Ctrl + C** 停掉，再执行：
 
 ```powershell
-py -3.12 start_sonify.py --port 8895
+python start_sonify.py --port 8895
 ```
 
 ---

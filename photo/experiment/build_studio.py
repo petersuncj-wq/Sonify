@@ -17,10 +17,10 @@ import struct
 import wave
 import numpy as np
 
-import run as lab
 import studio_grammar as sg
 import compose_blueprint as cbp
 import render_soundfont as rsf
+from midi_io import write_midi
 
 ROOT = Path(__file__).parent
 OUT = ROOT / 'dist'
@@ -37,27 +37,11 @@ BP_BAND_COLORS = ['#c98a3a', '#5f9ea0', '#8aa46f', '#b06a8f', '#9b8fc9']
 
 
 def export_midi(notes, path, tempo_bpm=120, pans=None):
-    events = []
-    ticks_per_second = 480 * tempo_bpm / 60
-    for v in range(5):
-        ns = [n for n in notes if n['voice'] == v]
-        if ns:
-            events.append((0, -1, bytes([0xC0 + v, ns[0]['program']])))
-            if pans is not None:
-                events.append((0,-1,bytes([0xB0+v,10,round((pans[v]+1)*63.5)])))
-    for n in notes:
-        events.extend([
-            (round(n['start'] * ticks_per_second), 1, bytes([0x90 + n['voice'], n['pitch'], max(1, min(127, n['velocity']))])),
-            (round((n['start'] + n['duration']) * ticks_per_second), 0, bytes([0x80 + n['voice'], n['pitch'], 0])),
-        ])
-    track = bytearray(b'\x00\xff\x51\x03' + round(60000000 / tempo_bpm).to_bytes(3, 'big'))
-    last = 0
-    for t, _, msg in sorted(events):
-        track += lab.vlq(t - last) + msg
-        last = t
-    track += b'\x00\xff\x2f\x00'
-    path.write_bytes(b'MThd' + struct.pack('>IHHH', 6, 0, 1, 480)
-                     + b'MTrk' + struct.pack('>I', len(track)) + track)
+    """Thin wrapper kept for the many call sites across `photo/intake`.
+
+    The real implementation now lives in `midi_io.write_midi`.
+    """
+    return write_midi(notes, path, tempo_bpm=tempo_bpm, pans=pans)
 
 
 def art_symbols(bp):

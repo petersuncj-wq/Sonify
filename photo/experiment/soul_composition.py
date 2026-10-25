@@ -29,8 +29,42 @@ BARS_PER_SECTION = 8
 DURATION = BAR * SECTIONS * BARS_PER_SECTION
 
 SECTION_ORDER = {'A': 0, 'B': 1, 'C': 2, 'A′': 3}
+
+# Register (音区) windows are expressed as *ratios* of the active scale
+# ladder instead of hard-coded absolute MIDI numbers.  The old absolute
+# table was silently coupled to `grammar.PENTA` (36..84): changing the
+# ladder start made `_in_win()` return an empty list, `_chord_pitches()`
+# fall back to an empty list too, and the whole voice went silent without
+# raising anything.  Ratios keep the registers valid for any ladder.
+REGISTER_RATIOS = {
+    0: (0.75, 1.00),   # melody    — top of the ladder
+    1: (0.60, 0.76),   # rhythm    — upper-middle
+    2: (0.00, 0.28),   # bass      — bottom
+    3: (0.27, 0.52),   # harmony   — lower-middle
+    4: (0.42, 0.68),   # ambience  — middle
+}
+# Absolute fallback windows, used only when the ladder is degenerate.
 REGISTER = {0: (69, 84), 1: (63, 70), 2: (38, 48), 3: (48, 59), 4: (55, 66)}
 REG_OFFSET = {0: 7, 1: 3, 2: -9, 3: -4, 4: -1}
+
+
+def _register_ranges(ladder):
+    """Derive the per-voice register windows from the active scale ladder.
+
+    The windows are proportional slices of `ladder`, so they remain valid
+    whatever the ladder's range happens to be (pentatonic `PENTA`, the
+    `west` chromatic ladder, or a future re-tuned ladder).
+    """
+    if not ladder:
+        raise ValueError('scale ladder is empty; cannot derive register windows')
+    lo, hi = float(ladder[0]), float(ladder[-1])
+    span = hi - lo
+    if span <= 0:
+        span = 1.0
+    ranges = {}
+    for voice, (a, b) in REGISTER_RATIOS.items():
+        ranges[voice] = (lo + span * a, lo + span * b)
+    return ranges
 
 # ---- styles ---------------------------------------------------------------
 STYLES = {
@@ -103,7 +137,19 @@ def _in_win(ladder, lo, hi):
 
 
 def _chord_pitches(ladder, pcs, lo, hi):
-    return [p for p in ladder if lo <= p <= hi and p % 12 in pcs]
+    """Chord tones of `pcs` inside [lo, hi].
+
+    Raises `ValueError` when the window contains no chord tone.  The old
+    implementation returned an empty list, and the caller then fell back to
+    `_in_win()` — if that was empty too, the voice went completely silent
+    without any error.  Failing loudly is the whole point of the fix.
+    """
+    tones = [p for p in ladder if lo <= p <= hi and p % 12 in pcs]
+    if not tones:
+        raise ValueError(
+            f'no chord tones in register [{lo:.1f},{hi:.1f}] for pcs {sorted(pcs)}; '
+            f'ladder range [{ladder[0] if ladder else "-"},{ladder[-1] if ladder else "-"}]')
+    return tones
 
 
 def _nearest_index(seq, value):
@@ -232,15 +278,25 @@ def _sample_curve(curve, n, reverse=False):
 
 
 def compose(units, grammar, style_key='east'):
+    # M8: the style key used to be looked up in `STYLES` without any
+    # validation, so a typo raised a bare `KeyError` deep inside the
+    # composer.  Validate explicitly and list the available keys.
+    if style_key not in STYLES:
+        raise ValueError(
+            f"unknown harmony style {style_key!r}; available: {', '.join(sorted(STYLES))}"
+        )
     style = STYLES[style_key]
     ladder = _ladder(grammar, style_key)
     chords = style['chords']
     prog = style['prog']
+    # Register windows are derived from the *active* ladder, so a change of
+    # scale (or of the ladder's range) can never silently mute a voice.
+    registers = _register_ranges(ladder)
 
     groups = {}
     for u in units:
         x, y = u['center']
-        v = grammar._voice_for(u)
+        v = grammar.voice_for(u)
         cell = (min(2, int(x * 3)), min(2, int(y * 3)), v)
         gid = ('user-' if 'user_voice' in u else 'g-') + '%s-%s-%s' % cell
         if 'user_region' in u:gid='user-region-%s-%s' % (u['user_region'],v)
@@ -347,8 +403,8 @@ def compose(units, grammar, style_key='east'):
                         deg = [deg[0], deg[2 % len(deg)], deg[4 % len(deg)],
                                deg[1 % len(deg)], deg[3 % len(deg)]]
                     lift = 5 if (letter == 'A′' and bi == BARS_PER_SECTION - 1) else 0
-                    tones = _chord_pitches(ladder, pcs, *REGISTER[0]) or _in_win(ladder, *REGISTER[0])
-                    centre = sum(REGISTER[0]) / 2
+                    tones = _chord_pitches(ladder, pcs, *registers[0])
+                    centre = sum(registers[0]) / 2
                     base = _nearest_index(ladder, min(tones, key=lambda p: abs(p - centre)))
                     tmpl = AUGMENTED if plan == 'A' else RHYTHMS[bi % len(RHYTHMS)]
                     final_beat = tmpl[-1][0]
@@ -358,10 +414,12 @@ def compose(units, grammar, style_key='east'):
                         idx = max(0, min(len(ladder) - 1, base + deg[k % len(deg)] + lift))
                         pitch = ladder[idx]
                         if letter == 'A′' and bi == last_bar and beat == final_beat:
-                            pitch = min((p for p in ladder if p%12==0 and 69<=p<=84), key=lambda p:abs(p-76))
-                            idx=ladder.index(pitch)
+                            lo_m, hi_m = registers[0]
+                            cadence = [p for p in ladder if p % 12 == 0 and lo_m <= p <= hi_m]
+                            pitch = min(cadence, key=lambda p: abs(p - (lo_m + hi_m) / 2))
+                            idx = ladder.index(pitch)
                         if beat == 0 or beat == final_beat:
-                            cts = _chord_pitches(ladder, pcs, *REGISTER[0]) or [pitch]
+                            cts = _chord_pitches(ladder, pcs, *registers[0])
                             idx = _nearest_index(ladder, min(cts, key=lambda p: abs(p - pitch)))
                             pitch = ladder[idx]
                         s = samples[min(k, len(samples) - 1)]
@@ -377,7 +435,7 @@ def compose(units, grammar, style_key='east'):
                 if v == 1:
                     if letter == 'B' and MELODY_PLAN['B'][bi] == 'M':
                         continue                      # stay quiet when the melody speaks
-                    tones = _chord_pitches(ladder, pcs, *REGISTER[1]) or _in_win(ladder, *REGISTER[1])
+                    tones = _chord_pitches(ladder, pcs, *registers[1])
                     pattern = RHYTHM_PATTERN if letter == 'C' and bi%2 else [0,1.5,3]
                     for j, beat in enumerate(pattern):
                         pitch = tones[(j + bi) % len(tones)]
@@ -388,18 +446,19 @@ def compose(units, grammar, style_key='east'):
 
                 # ---------------- bass (v2): root with stepwise connection
                 if v == 2:
-                    cwin = _chord_pitches(ladder, pcs, *REGISTER[2]) or _in_win(ladder, *REGISTER[2])
-                    roots=[p for p in ladder if REGISTER[2][0]<=p<=REGISTER[2][1] and p%12==root_pc]
-                    root = min(roots or cwin, key=lambda p:abs(p-(prev_bass if prev_bass is not None else 43)))
+                    cwin = _chord_pitches(ladder, pcs, *registers[2])
+                    roots = [p for p in ladder if registers[2][0] <= p <= registers[2][1] and p % 12 == root_pc]
+                    root = min(roots or cwin, key=lambda p: abs(p - (prev_bass if prev_bass is not None else cwin[0])))
                     prev_bass = root
-                    fifths=[p for p in cwin if p!=root]
-                    fifth=min(fifths,key=lambda p:abs(p-root-7)) if fifths else root
-                    plan = [(0,root,3.5)] if letter=='A' else [(0,root,1.6),(2,fifth,1.6)]
-                    if letter=='C':
-                        nxt=prog[letter][min(last_bar,bi+1)];npc=chords[nxt][0]
-                        targets=[p for p in ladder if 38<=p<=48 and p%12==npc]
-                        target=min(targets or [root],key=lambda p:abs(p-fifth))
-                        plan=[(0,root,1.4),(1.5,fifth,1.1),(3,target,.85)]
+                    fifths = [p for p in cwin if p != root]
+                    fifth = min(fifths, key=lambda p: abs(p - root - 7)) if fifths else root
+                    plan = [(0, root, 3.5)] if letter == 'A' else [(0, root, 1.6), (2, fifth, 1.6)]
+                    if letter == 'C':
+                        nxt = prog[letter][min(last_bar, bi + 1)]
+                        npc = chords[nxt][0]
+                        targets = [p for p in ladder if registers[2][0] <= p <= registers[2][1] and p % 12 == npc]
+                        target = min(targets or [root], key=lambda p: abs(p - fifth))
+                        plan = [(0, root, 1.4), (1.5, fifth, 1.1), (3, target, .85)]
                     if letter=='A′' and bi>=5: plan=[(0,root,3.85)]
                     for beat, bass_pitch, length in plan:
                         add(2, head, bass_pitch, beat, length, letter, bi, 'harmony',
@@ -410,7 +469,7 @@ def compose(units, grammar, style_key='east'):
                 # ---------------- harmony (v3): voice-led chord bed
                 if v == 3:
                     count=3 if letter=='A′' and bi==last_bar else 2
-                    voicing = _voice_lead(ladder, pcs, *REGISTER[3], prev_harmony, count)
+                    voicing = _voice_lead(ladder, pcs, *registers[3], prev_harmony, count)
                     prev_harmony = voicing
                     for pitch in voicing:
                         add(3, head, pitch, 0, 3.94, letter, bi, 'harmony',
@@ -421,7 +480,7 @@ def compose(units, grammar, style_key='east'):
                 # ---------------- ambience (v4): open tone, changes per section
                 if (letter=='A' and bi%2) or (letter=='A′' and bi in (4,5)):
                     continue
-                tones = _chord_pitches(ladder, pcs, *REGISTER[4]) or _in_win(ladder, *REGISTER[4])
+                tones = _chord_pitches(ladder, pcs, *registers[4])
                 pitch = tones[0]
                 add(4, head, pitch, 0, 3.94, letter, bi, 'ambient',
                     calc('open_voicing', .5, .5, .12, 0, 0, 0, ladder.index(pitch), head),

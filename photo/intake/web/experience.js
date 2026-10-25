@@ -5,7 +5,42 @@ const terminal=j=>['completed','failed'].includes(j.status);
 async function api(url,options){const response=await fetch(url,options),data=await response.json();if(!response.ok)throw new Error(data.error||(data.errors||[]).map(x=>x.error).join(' ')||'连接失败，请稍后重试。');return data;}
 function persist(){localStorage.setItem(storeKey,JSON.stringify({selected,view,mode,closed:document.body.classList.contains('library-closed')}));if(selected){const u=new URL(location.href);u.searchParams.set('job',selected);u.searchParams.delete('view');history.replaceState(null,'',u);}}
 function clearFrame(){revision++;if(focusObserver)focusObserver.disconnect();focusObserver=null;document.body.classList.remove('frame-focus','journey-view');if(frameTimer)clearTimeout(frameTimer);frameTimer=null;if(frame){frame.src='about:blank';frame.remove();frame=null;}$('#frame-host').replaceChildren();$('#frame-host').hidden=true;}
-function list(){const container=$('#items');container.replaceChildren();const rows=[...jobs.values()].sort((a,b)=>b.created_at-a.created_at);$('#total').textContent=rows.length;for(const job of rows){const button=document.createElement('button');button.className='item';button.setAttribute('aria-pressed',String(job.id===selected));const image=new Image();image.src=job.artistic||job.original;image.alt='作品缩略图';image.loading='lazy';const info=document.createElement('span'),title=document.createElement('strong'),state=document.createElement('small');title.textContent=`${job.submission==='phone'?'手机图片':'图片'} · ${job.id.slice(0,6).toUpperCase()}`;const providerLabel={'supplied':'本地精细线稿','local':job.fallback_from?'快速备用':'快速本地','seedream':'云端','comfy':'ComfyUI'}[job.provider]||job.provider;state.textContent=providerLabel+' · '+(job.error?'未完成，可重试':job.music_status==='completed'?'作品已就绪':job.stage);info.append(title,state);button.append(image,info);button.onclick=()=>choose(job.id);container.append(button);}}
+function jobLabel(job){return job.title||`${job.submission==='phone'?'手机图片':'图片'} · ${job.id.slice(0,6).toUpperCase()}`;}
+// M11: inline rename.  The whole row used to be a <button>, and a <button>
+// may not contain an <input> (invalid HTML, and the click would bubble to
+// the row's select handler).  The row is therefore a <div> that holds a
+// separate select button and a separate rename button.
+function makeRenameControl(job,info,title){
+ const rename=document.createElement('button');
+ rename.className='rename-button';rename.type='button';rename.textContent='✎';
+ rename.setAttribute('aria-label','重命名作品');rename.title='重命名作品';
+ rename.onclick=async(event)=>{
+  event.stopPropagation();
+  const input=document.createElement('input');
+  input.className='rename-input';input.maxLength=60;input.value=job.title||'';
+  input.setAttribute('aria-label','作品名');
+  title.replaceWith(input);
+  input.focus();input.select();
+  let settled=false;
+  const commit=async()=>{
+   if(settled)return;settled=true;
+   const next=input.value.trim();
+   try{
+    if(next&&next!==job.title){
+     const updated=await api('/api/jobs/'+job.id+'/title',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:next})});
+     jobs.set(updated.id,updated);
+    }
+   }catch(error){
+    $('#upload-note').textContent=error.message||'重命名失败，请稍后再试。';
+   }
+   list();
+  };
+  input.onblur=commit;
+  input.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();input.blur();}else if(e.key==='Escape'){input.value=job.title||'';input.blur();}};
+ };
+ return rename;
+}
+function list(){const container=$('#items');container.replaceChildren();const rows=[...jobs.values()].sort((a,b)=>b.created_at-a.created_at);$('#total').textContent=rows.length;for(const job of rows){const row=document.createElement('div');row.className='item';row.setAttribute('aria-pressed',String(job.id===selected));const button=document.createElement('button');button.className='item-select';button.setAttribute('aria-pressed',String(job.id===selected));const image=new Image();image.src=job.artistic||job.original;image.alt='作品缩略图';image.loading='lazy';const info=document.createElement('span'),title=document.createElement('strong'),state=document.createElement('small');title.textContent=jobLabel(job);const providerLabel={'supplied':'本地精细线稿','local':job.fallback_from?'快速备用':'快速本地','seedream':'云端','comfy':'ComfyUI'}[job.provider]||job.provider;state.textContent=providerLabel+' · '+(job.error?'未完成，可重试':job.music_status==='completed'?'作品已就绪':job.stage);info.append(title,state);button.append(image,info);button.onclick=()=>choose(job.id);row.append(button,makeRenameControl(job,info,title));container.append(row);}}
 function waiting(job){$('#waiting').hidden=false;$('#mode-nav').hidden=true;$('#replay').hidden=true;$('#waiting-images').replaceChildren();if(!job)return;$('.empty-symbol').hidden=true;$('#waiting-title').textContent=job.error?'这次生成未完成':job.music_status==='failed'?'线稿已准备好，音乐未完成':'你的图片，正在成为作品。';$('#waiting-state').textContent=job.error||job.music_error||job.stage;$('#fallback-local').hidden=!(job.provider==='seedream'&&job.status==='failed'&&job.artistic_status==='failed'&&!job.artistic);$('#retry').hidden=!(job.status==='failed'||job.music_status==='failed');$('#retry').disabled=retryBusy;$('#retry').textContent=job.music_status==='failed'&&job.structural?'只重试音乐（复用线稿）':'重新生成';for(const [url,label] of [[job.original,'你的原图'],[job.artistic||job.structural,'已生成的线稿']]){if(!url)continue;const fig=document.createElement('figure'),im=new Image(),caption=document.createElement('figcaption');im.src=url;im.alt=label;caption.textContent=label;fig.append(im,caption);$('#waiting-images').append(fig);}$('#view-note').textContent=terminal(job)?'原图与已成功的产物已保留，失败不影响其他作品。':'这里显示实际处理状态；线稿和音乐准备完成后，才播放生成旅程。';}
 function selectMode(next){if(!['soul','blueprint','progressive'].includes(next))return;mode=next;if(frameTimer)clearTimeout(frameTimer);document.querySelectorAll('#mode-nav button').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.mode===mode)));persist();if(!frame)return;const ticket=revision;let tries=0;const apply=()=>{if(ticket!==revision||!frame)return;try{const doc=frame.contentDocument,play=doc?.querySelector('#play'),tab=doc?.querySelector(`button[data-mode="${next}"]`);if(tab&&play&&!play.disabled){tab.click();return;}}catch(e){}if(++tries<100)frameTimer=setTimeout(apply,150);else $('#view-note').textContent='作品载入较慢，可在作品内直接选择模式，或重新打开。';};apply();}
 function mount(kind){const job=jobs.get(selected);if(!job||job.music_status!=='completed'||!job.workspace)return;clearFrame();$('#eyebrow').textContent='YOUR IMAGE · YOUR MUSIC';view=kind;document.body.classList.toggle('journey-view',kind==='journey');$('#waiting').hidden=true;$('#frame-host').hidden=false;$('#mode-nav').hidden=kind!=='perform';$('#replay').hidden=kind!=='perform';frame=document.createElement('iframe');frame.title=kind==='journey'?'图片成为音乐的生成旅程':'当前图片的三个音乐观看模式';frame.allow='autoplay; fullscreen';const ticket=revision;frame.onload=()=>{if(ticket!==revision||!frame)return;if(kind==='perform'){try{const doc=frame.contentDocument,style=doc.createElement('style');style.textContent=`body>header,main>.intro,main>nav[aria-label="作品模式"]{display:none!important}main{padding-top:10px!important}

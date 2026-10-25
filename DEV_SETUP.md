@@ -9,7 +9,7 @@
 
 | 你想做什么 | 用哪个 |
 |---|---|
-| 只想跑起来 | 下载 Release 的 `Sonify-Runnable-20261018.zip`（带音源、长卷、Paint 构建页） |
+| 只想跑起来 | 下载 Release 的 `Sonify-Runnable-20261025.zip`（带音源、长卷、Paint 构建页） |
 | 想改代码 | clone 源码仓库；依赖用 `photo/requirements-share.txt` |
 
 > - 源码仓库**不含**构建后的 Paint HTML（`Sonify-Fourier.html` / `MusicPaint.html`），所以 `start_sonify.py --check` 会显示 `Paint: False`。需要 Paint 请用 Release zip，或按 `paint/modules/*/源码` 构建。
@@ -20,8 +20,8 @@
 ## 1. Clone
 
 ```bash
-git clone https://github.com/petersuncj-wq/Sonify.git
-cd Sonify
+git clone https://github.com/DClovewatch-deville/Sonify1.1.git
+cd Sonify1.1
 ```
 
 仓库约 **6 MB**，克隆很快。

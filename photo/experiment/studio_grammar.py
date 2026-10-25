@@ -172,7 +172,13 @@ def sample_path(points, count: int):
     return [[float(np.interp(v, d, a[:, i])) for i in range(2)] for v in pos]
 
 
-def _voice_for(unit: dict) -> int:
+def voice_for(unit: dict) -> int:
+    """Public API: map a classified unit onto its voice index.
+
+    Previously this was the private `_voice_for`, which other modules had to
+    reach into (`build_studio.compact_units`).  The private alias is kept
+    for backwards compatibility.
+    """
     if 'user_voice' in unit:
         return unit['user_voice']
     if unit['layer'] == 'background':
@@ -182,6 +188,10 @@ def _voice_for(unit: dict) -> int:
         'h_line': ROLE_TO_VOICE['support'],
         'loop': ROLE_TO_VOICE['loop'],
     }.get(unit['type'], ROLE_TO_VOICE['melody'])
+
+
+# Backwards-compatible alias for older call sites.
+_voice_for = voice_for
 
 
 def _sample_count(unit: dict) -> int:
@@ -252,32 +262,84 @@ def _schedule(candidates, limit_end: float, max_concurrent: int = MAX_CONCURRENT
     Candidates are processed in ascending desired start.  For each one we
     find the earliest time >= its desired start at which fewer than
     `max_concurrent` notes are sounding and no same voice+pitch is still
-    ringing.  Notes that already ended before the current desired start can
-    never affect a later candidate, so they are dropped from the working
-    heap (keeps the heap small)."""
-    import heapq
-    heap = []          # (end, start, voice, pitch) for accepted notes
+    ringing.
+
+    Performance (M3)
+    -----------------
+    The previous implementation kept *every* accepted note in a heap and
+    scanned the whole heap for every candidate, which is O(n²).  On dense
+    blueprints (12 000+ symbols) this was the dominant CPU cost of the
+    whole pipeline.
+
+    The scheduler now uses a **sliding window** over the accepted notes.
+    A note can only be sounding at time `t` when it started no earlier
+    than `t - max_duration` (every note is shorter than that), so the
+    window `(t - max_duration, t]` contains every note that could possibly
+    conflict.  The accepted notes are kept in a list ordered by start
+    time, so the window bounds are found with two binary searches and only
+    the notes inside the window are inspected.  The result is O(n log n)
+    plus the (small) window size instead of O(n²).
+
+    Exactness
+    ---------
+    The window is a strict superset of the old "sounding" set and the
+    membership test is the same inequality, so the produced schedule is
+    identical to the previous implementation.  This is verified by
+    `test_scheduler.py`, which keeps the original algorithm as a reference
+    oracle and compares the two on randomised inputs.
+
+    Termination
+    -----------
+    The probe loop stops as soon as the candidate can no longer fit before
+    `limit_end`; the old code kept probing for up to 4 000 iterations
+    only to reject the candidate anyway.  The 4 000-iteration guard is
+    kept as a second safety net.
+    """
+    import bisect
+
     accepted = []
+    # Accepted notes ordered by their scheduled start time.
+    order = []            # sorted list of (start, seq)
+    notes = {}            # seq -> (end, voice, pitch)
+    seq = 0
+
+    # Longest note duration: the sliding window never has to look further
+    # back than this.
+    max_duration = 0.0
+    for c in candidates:
+        d = float(c['duration'])
+        if d > max_duration:
+            max_duration = d
+
     for c in candidates:
         s = float(c['start'])
-        while heap and heap[0][0] <= s + 1e-9:
-            heapq.heappop(heap)
-        t = s
         dur = float(c['duration'])
         v = int(c['voice'])
         p = int(c['pitch'])
+
+        t = s
         for _ in range(4000):
+            # The probe time only moves forward inside a candidate, so once
+            # the candidate no longer fits into the window it is rejected.
+            if t + dur > limit_end - 0.05:
+                break
+            # Every note that could still be sounding at `t` started inside
+            # this window.
+            lo = bisect.bisect_left(order, (t - max_duration, -1))
+            hi = bisect.bisect_right(order, (t + 1e-9, float('inf')))
             active = 0
-            conflict = False
+            clash = False
             earliest = None
-            for e, st, vv, pp in heap:
-                if st - 1e-9 <= t < e - 1e-9:
-                    active += 1
-                    if vv == v and pp == p:
-                        conflict = True
-                    if earliest is None or e < earliest:
-                        earliest = e
-            if active < max_concurrent and not conflict:
+            for start, nid in order[lo:hi]:
+                end, voice, pitch = notes[nid]
+                if end <= t + 1e-9:
+                    continue                      # already stopped
+                active += 1
+                if earliest is None or end < earliest:
+                    earliest = end
+                if voice == v and pitch == p:
+                    clash = True
+            if active < max_concurrent and not clash:
                 break
             if earliest is None or earliest <= t + 1e-9:
                 t += 0.05
@@ -286,11 +348,11 @@ def _schedule(candidates, limit_end: float, max_concurrent: int = MAX_CONCURRENT
         if t + dur > limit_end - 0.05:
             continue
         c['start'] = round(t, 3)
-        heapq.heappush(heap, (t + dur, t, v, p))
+        seq += 1
+        notes[seq] = (t + dur, v, p)
+        bisect.insort(order, (t, seq))
         accepted.append(c)
     return accepted
-
-
 def _to_notes(candidates, mode: str):
     notes = []
     for c in candidates:
@@ -309,12 +371,24 @@ def _to_notes(candidates, mode: str):
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
-def compose_units(units, mode: str = 'soul'):
-    """Compose the full classified geometry into a traceable note list."""
+def compose_units(units, mode: str = 'soul', style_key: str = 'east'):
+    """Compose the full classified geometry into a traceable note list.
+
+    `style_key` selects the harmony style of the Soul composition:
+
+      * ``'east'`` — pentatonic, open / quartal voicings (the default),
+      * ``'west'`` — functional major-key triads and sevenths.
+
+    M8: the ``'west'`` style was fully implemented (chords, progressions,
+    scale) but no call site could ever reach it, so roughly a dozen lines
+    of carefully written harmony data were never exercised.  The style is
+    now selectable, and `soul_composition.STYLES` remains the single
+    source of truth for the available keys.
+    """
     if mode == 'progressive':
         from soul_composition import compose
         from progressive_arrangement import arrange
-        return arrange(compose(units, __import__(__name__)), units=units)
+        return arrange(compose(units, __import__(__name__), style_key), units=units)
     if mode == 'progressive_legacy':
         notes = []
         phases = []
@@ -335,19 +409,30 @@ def compose_units(units, mode: str = 'soul'):
                     voice_catalog=VOICE_CATALOG, version='studio-0.5')
 
     from soul_composition import compose
-    return compose(units, __import__(__name__))
+    return compose(units, __import__(__name__), style_key)
 
 
-def _overlap_peak(notes) -> int:
+def overlap_peak(notes) -> int:
+    """Maximum number of simultaneously sounding notes.
+
+    Public API (previously the private `_overlap_peak`).  It is a small,
+    dependency-free measurement helper that the regression tests use to
+    assert the hard polyphony budget; it lives here so that the test
+    module does not have to reach into a private symbol.
+    """
     # Round to microseconds so a note's end ties with another's start and
     # is processed as an "off" before the next "on" (avoid float drift).
     events = []
     for n in notes:
-        events.append((round(n['start'], 6), 1))
-        events.append((round(n['start'] + n['duration'], 6), -1))
+        events.append((round(float(n['start']), 6), 1))
+        events.append((round(float(n['start']) + float(n['duration']), 6), -1))
     events.sort()
     cur = peak = 0
     for _, v in events:
         cur += v
         peak = max(peak, cur)
     return peak
+
+
+# Backwards-compatible alias for older call sites.
+_overlap_peak = overlap_peak

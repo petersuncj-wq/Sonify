@@ -9,6 +9,25 @@ from seasonal_rules import SEASON_RULES
 
 SEASONS=SEASON_RULES
 
+# M9 (robustness): the stem prefix used to be written out inline in two
+# places with *different* strings — the generator used
+# `f'{slug}-season-v11-{id}-{preset}'` while the cleanup path looked for
+# `f"{id}-season-{state_id}-{preset}-{voice}.wav"` (missing both the
+# `v11` marker and the slug).  When `mix_stems()` raised, the five
+# intermediate stems survived on disk: 80 leftover 37-second stereo WAVs
+# per failed upload, which is exactly what fills up the disk on an
+# exhibition machine.
+#
+# A single helper now produces the prefix, and the stems are removed in a
+# `finally` block so they are cleaned up even when rendering fails.
+def _stem_prefix(slug,state_id,preset):
+ """The one and only stem prefix for a seasonal mix."""
+ return f'{slug}-season-v11-{state_id}-{preset}'
+
+def _identity_prefix(slug,preset):
+ """The one and only prefix for an identity-theme preview."""
+ return f'{slug}-identity-{preset}.wav'
+
 def interpretations(original):
  image=Image.open(original).convert('RGB');image.thumbnail((1000,1000))
  for rule in SEASONS:
@@ -27,11 +46,14 @@ def build(payload,units,original,assets,pool,sf):
   color=analyze(image,'colour interpretation of the same original; no scene generation')
   music={}
   for preset in PRESETS:
-   m=arrange(payload['soul'],preset,units,color,'auto',season=rule,identity_mode=True);prefix=f'{slug}-season-v11-{id}-{preset}'
-   for v in range(5):rsf.render_wav([n for n in m['notes'] if n['voice']==v],assets/f'{prefix}-{v}.wav',sf_path=sf,total_seconds=37,rate=22050,pool=pool,normalize=False)
-   audio,rate=mix_stems(prefix,m,assets)
-   # Living mode plays mixes; these newly generated intermediate stems are disposable.
-   for v in range(5):(assets/f'{prefix}-{v}.wav').unlink()
+   m=arrange(payload['soul'],preset,units,color,'auto',season=rule,identity_mode=True);prefix=_stem_prefix(slug,id,preset)
+   try:
+    for v in range(5):rsf.render_wav([n for n in m['notes'] if n['voice']==v],assets/f'{prefix}-{v}.wav',sf_path=sf,total_seconds=37,rate=22050,pool=pool,normalize=False)
+    audio,rate=mix_stems(prefix,m,assets)
+   finally:
+    # M9: the intermediate stems are disposable (Living mode plays the
+    # mixed file), so they are removed whether or not the mix succeeded.
+    for v in range(5):(assets/f'{prefix}-{v}.wav').unlink(missing_ok=True)
    # Comparable level without stripping the shared 36-second dynamic narrative.
    rms=float(np.sqrt(np.mean(audio*audio)));gain=min(.10/max(1e-8,rms),.85/max(.001,float(np.abs(audio).max())))
    from build_progressive_arrangement import write
@@ -41,7 +63,7 @@ def build(payload,units,original,assets,pool,sf):
  identities={}
  for preset in PRESETS:
   m=arrange(payload['soul'],preset,units,payload.get('color_dna'),'off',identity_mode=True)
-  prefix=f'{slug}-identity-{preset}.wav';theme_notes=[n for n in m['notes'] if n['arrangement_role']=='original_theme']
+  prefix=_identity_prefix(slug,preset);theme_notes=[n for n in m['notes'] if n['arrangement_role']=='original_theme']
   rsf.render_wav(theme_notes,assets/prefix,sf_path=sf,total_seconds=8,rate=22050,pool=pool,normalize=True)
   identities[preset]=dict(theme=m['theme'],notes=theme_notes,key_pc=m['key_pc'],audio='studio/'+prefix,relative_intervals=[b['pitch']-a['pitch'] for a,b in zip(m['theme'],m['theme'][1:])],starts=[n['start'] for n in theme_notes])
  payload['living_color']=dict(version='four-seasons-1.1',kind='colour_interpretation_with_atmosphere',identity=identities,geometry_fixed=True,states=states,transition='image and atmosphere interpolate; music changes at 2-second bar boundaries with a short fade through silence',sync_bpm=120)
@@ -85,7 +107,9 @@ if __name__=='__main__':
    normalize_levels(p,path.parent);pending=path.with_suffix('.living.json');pending.write_text(json.dumps(p,ensure_ascii=False,separators=(',',':')),encoding='utf8');pending.replace(path)
    for state in p['living_color']['states']:
     for preset in PRESETS:
+     # M9: use the shared prefix helper so the cleanup path can no
+     # longer drift away from the naming used at render time.
      for voice in range(5):
-      stem=path.parent/f"{p['id']}-season-{state['id']}-{preset}-{voice}.wav"
+      stem=path.parent/f'{_stem_prefix(p["id"],state["id"],preset)}-{voice}.wav'
       if stem.exists():stem.unlink()
   print('Living levels matched within each style')

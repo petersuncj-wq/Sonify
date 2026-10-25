@@ -19,6 +19,8 @@ def main():
     parser.add_argument('--no-browser',action='store_true')
     parser.add_argument('--check',action='store_true')
     parser.add_argument('--paint-only',action='store_true')
+    parser.add_argument('--lan',action='store_true',
+                        help='允许局域网内其它设备访问主控台（默认仅监听 127.0.0.1）。')
     args=parser.parse_args()
     if not 1024<=args.port<=65530:parser.error('端口应为1024—65530')
     required={'numpy':'numpy','PIL':'Pillow','cv2':'opencv-contrib-python-headless','tinysoundfont':'tinysoundfont','mido':'mido','soundfile':'soundfile','qrcode':'qrcode[pil]'}
@@ -43,7 +45,13 @@ def main():
             command=[sys.executable,'-m','http.server',str(port),'--bind','127.0.0.1','--directory',str(ROOT/'paint')]
         else:
             discover=subprocess.Popen([sys.executable,str(ROOT/'photo/intake/discover_service.py')],cwd=ROOT,env=env,creationflags=creationflags);processes.append(discover)
-            command=[sys.executable,str(ROOT/'photo/intake/server.py'),'--port',str(port),'--share','--guest-port',str(port+1),'--host-bind','0.0.0.0']
+            # H1 (security): the host console used to listen on 0.0.0.0 with
+            # no authentication at all, so any device on the LAN could list
+            # every job, download every original photo and burn the paid
+            # Seedream API quota.  Default to loopback only; `--lan` is now
+            # an explicit opt-in.
+            host_bind='0.0.0.0' if args.lan else '127.0.0.1'
+            command=[sys.executable,str(ROOT/'photo/intake/server.py'),'--port',str(port),'--share','--guest-port',str(port+1),'--host-bind',host_bind]
         server=subprocess.Popen(command,cwd=ROOT,env=env,creationflags=creationflags);processes.append(server)
         url=f'http://127.0.0.1:{port}/'
         for _ in range(150):
@@ -55,6 +63,10 @@ def main():
         else:raise RuntimeError('启动超时')
         print('SONIFY 最终整合版!!!',flush=True)
         print('主页:',url,'\n扫码接待:',url+'host','\nPhoto:',url+'experience','\nLab:',url+'musiclab',flush=True)
+        if args.lan:
+            print('已启用局域网访问（--lan）：同网设备可直接访问主控台，请仅在受信任网络使用。',flush=True)
+        else:
+            print('主控台仅监听 127.0.0.1；如需让手机扫码访问，请使用 --lan 启动。',flush=True)
         if port!=args.port:print('旧版本占用了原端口，当前整合版使用上面的新地址。',flush=True)
         if not args.no_browser:webbrowser.open(url)
         return server.wait()

@@ -29,34 +29,60 @@ def find_soundfont(explicit: str | None = None,
                    search_dirs: list[Path] | None = None) -> str | None:
     """Locate a FluidR3_GM (.sf2 / .sf3) soundfont.
 
-    Search order: explicit path → env vars → given dirs → common vendor paths.
+    Search order: explicit path → env vars → given dirs → vendor paths.
+    Every path is resolved relative to this file, so the lookup does not
+    depend on the current working directory.
     """
-    if explicit and os.path.exists(explicit):
-        return explicit
-    for env in ("PYIANNIX_SF2", "SONIFY_SF2", "SONIFY_SOUNDFONT"):
-        p = os.environ.get(env)
-        if p and os.path.exists(p):
-            return p
-    candidates: list[Path] = []
-    if search_dirs:
-        candidates.extend(search_dirs)
-    # Resolve vendor / sibling-project paths relative to this file so the
-    # renderer works from any clone location, not just D:\Hackathon_SKD_Laptop.
+    for candidate in _soundfont_candidates(explicit, search_dirs):
+        if candidate.exists():
+            return str(candidate)
+    # Also try any *.sf2 / *.sf3 inside the well-known soundfont folders.
     here = Path(__file__).resolve().parent
     root = here.parent.parent
-    candidates.extend([
-        here / 'dist' / 'soundfonts' / 'FluidR3Mono_GM.sf3',
-        root / 'Existed_Project_Github' / 'Existed_Program_Github_IanniX'
-        / 'soundfonts' / 'FluidR3Mono_GM.sf3',
-        root / 'Existed_Project_Github' / 'Existed_Program_Github_IanniX'
-        / 'soundfonts' / 'FluidR3_GM.sf3',
-        Path('experiment/dist/soundfonts/FluidR3Mono_GM.sf3'),
-        Path('soundfonts/FluidR3Mono_GM.sf3'),
-    ])
-    for c in candidates:
-        if c.exists():
-            return str(c)
+    for folder in (here / 'dist' / 'soundfonts', root / 'soundfonts'):
+        if folder.is_dir():
+            for found in sorted(folder.iterdir()):
+                if found.suffix.lower() in ('.sf2', '.sf3'):
+                    return str(found)
     return None
+
+
+def _soundfont_candidates(explicit: str | None = None,
+                          search_dirs: list[Path] | None = None) -> list[Path]:
+    """Every absolute path the soundfont lookup inspects."""
+    here = Path(__file__).resolve().parent
+    root = here.parent.parent
+    paths: list[Path] = []
+    if explicit:
+        paths.append(Path(explicit))
+    for env in ("PYIANNIX_SF2", "SONIFY_SF2", "SONIFY_SOUNDFONT"):
+        value = os.environ.get(env)
+        if value:
+            paths.append(Path(value))
+    if search_dirs:
+        paths.extend(Path(d) for d in search_dirs)
+    paths.extend([
+        here / 'dist' / 'soundfonts' / 'FluidR3Mono_GM.sf3',
+        here / 'dist' / 'soundfonts' / 'FluidR3_GM.sf2',
+        here / 'dist' / 'soundfonts' / 'FluidR3_GM.sf3',
+        root / 'photo' / 'experiment' / 'dist' / 'soundfonts' / 'FluidR3Mono_GM.sf3',
+        root / 'soundfonts' / 'FluidR3Mono_GM.sf3',
+        root / 'soundfonts' / 'FluidR3_GM.sf2',
+    ])
+    return paths
+
+
+def searched_soundfont_paths(explicit: str | None = None) -> list[Path]:
+    """Public helper: the absolute paths `find_soundfont()` inspects."""
+    return _soundfont_candidates(explicit)
+
+
+def _soundfont_missing_message() -> str:
+    """Actionable error text listing every searched absolute path."""
+    searched = _soundfont_candidates()
+    return ('no FluidR3 .sf2 / .sf3 found; set the SONIFY_SF2 environment '
+            'variable or place a soundfont in one of these locations:\n  '
+            + '\n  '.join(str(p) for p in searched))
 
 
 # Per-preset channel volume calibration, copied from MusicPaint's
@@ -82,6 +108,59 @@ def _voice_budget(notes: Sequence[dict]) -> int:
         if cur > maxc:
             maxc = cur
     return maxc
+
+
+def validate_note(note: dict) -> None:
+    """M5 (robustness): reject notes that the MIDI spec cannot express.
+
+    The renderer used to clamp silently:
+
+        pitch = max(0, min(127, int(n['pitch'])))
+
+    A note whose pitch fell outside MIDI 0–127 was therefore rendered at
+    the edge of the keyboard without any warning.  That breaks the
+    project's core promise that every note can be traced back to the
+    geometry it came from: the *heard* pitch no longer matches the
+    *computed* pitch, and nothing in the output says so.
+
+    This validator raises instead.  It is called from every render entry
+    point, so an out-of-range pitch fails loudly at the point where it can
+    still be attributed to a source.  The clamp stays in place as a last
+    line of defence for third-party callers that bypass the validator.
+    """
+    pitch = note.get('pitch')
+    if pitch is None:
+        raise ValueError(f"note {note.get('id', '?')} has no pitch")
+    try:
+        value = int(pitch)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"note {note.get('id', '?')} has a non-numeric pitch {pitch!r}"
+        ) from None
+    if not 0 <= value <= 127:
+        raise ValueError(
+            f"note {note.get('id', '?')} pitch {value} is outside the MIDI "
+            f"range 0–127 (source={note.get('source')!r}, voice={note.get('voice')!r})"
+        )
+    velocity = note.get('velocity')
+    if velocity is not None:
+        try:
+            vel = int(velocity)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"note {note.get('id', '?')} has a non-numeric velocity {velocity!r}"
+            ) from None
+        if not 0 <= vel <= 127:
+            raise ValueError(
+                f"note {note.get('id', '?')} velocity {vel} is outside the "
+                f"MIDI range 0–127 (source={note.get('source')!r})"
+            )
+
+
+def validate_notes(notes: Sequence[dict]) -> None:
+    """Validate a whole note list (see `validate_note`)."""
+    for note in notes:
+        validate_note(note)
 
 
 class _SoundFontPool:
@@ -148,7 +227,7 @@ def render_wav(notes: Sequence[dict], path: Path,
         raise RuntimeError("tinysoundfont not installed")
     sf = sf_path or find_soundfont()
     if not sf:
-        raise RuntimeError("no FluidR3 .sf2 / .sf3 found; set SONIFY_SF2 env var")
+        raise RuntimeError(_soundfont_missing_message())
     if not notes:
         # emit a silent WAV so the file is always present
         silent = np.zeros(int(total_seconds * rate), dtype=np.float32)
@@ -168,6 +247,9 @@ def render_wav(notes: Sequence[dict], path: Path,
     for n in notes:
         p = int(n.get('program', 0))
         ch = pool.channel_for(p)
+        # M5: fail loudly on an out-of-range pitch instead of silently
+        # clamping it to the edge of the keyboard.
+        validate_note(n)
         pitch = max(0, min(127, int(n['pitch'])))
         vel = max(1, min(127, int(n.get('velocity', 80))))
         on_sample = int(round(float(n['start']) * rate))
@@ -272,7 +354,7 @@ def render_blueprint_soundfont(notes: Sequence[dict], path: Path,
         raise RuntimeError("tinysoundfont not installed")
     sf = sf_path or find_soundfont()
     if not sf:
-        raise RuntimeError("no FluidR3 .sf2 / .sf3 found; set SONIFY_SF2 env var")
+        raise RuntimeError(_soundfont_missing_message())
     if not notes:
         silent = np.zeros(int(total_seconds * rate), dtype=np.float32)
         _write_wav(silent, rate, path, channels=2)
@@ -317,6 +399,8 @@ def render_blueprint_soundfont(notes: Sequence[dict], path: Path,
         for n in ns_thin:
             on = int(round(float(n['start']) * rate))
             off = int(round((float(n['start']) + float(n['duration'])) * rate))
+            # M5: reject an out-of-range pitch loudly rather than clamping.
+            validate_note(n)
             pitch = max(0, min(127, int(n['pitch'])))
             vel = max(1, min(127, int(n.get('velocity', 80))))
             events.append((max(0, on), 1, pitch, vel))

@@ -133,7 +133,7 @@ $('#reveal-stages').onclick=e=>{const b=e.target.closest('[data-reveal-time]');i
 $('#reveal-explore').onclick=()=>{if(revealFocus)setRevealFocus(false);$('#grammar-details').open=!$('#grammar-details').open;document.body.classList.toggle('reveal-details',$('#grammar-details').open);if($('#grammar-details').open)$('#grammar-details').scrollIntoView({behavior:'smooth',block:'start'});};
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&revealFocus)setRevealFocus(false);});
 
-$('#reveal-style').onchange=e=>{halt(true);progressivePreset=e.target.value;configure();};
+$('#reveal-style').onchange=e=>{const resume=playing||loading;halt(true);progressivePreset=e.target.value;configure();ensureProgressiveAudio();if(resume)play();};
 
 function drawRevealNotes(t){
  const c=$('#reveal-notes'),g=c.getContext('2d'),m=musicObj(),w=c.width,h=c.height;
@@ -160,11 +160,11 @@ canvas.addEventListener('click',e=>{
  if(hit){const n=m.notes.find(n=>n.voice===0&&n.source===hit);if(n){seek(n.start);$('#status').textContent='已定位主轮廓主题，点击播放可听对应乐句。';}}
 });
 
-$('#reveal-color').onchange=e=>{const resume=playing||loading;halt();progressiveColor=e.target.value;configure();if(resume)play();};
+$('#reveal-color').onchange=e=>{const resume=playing||loading;halt();progressiveColor=e.target.value;configure();ensureProgressiveAudio();if(resume)play();};
 
 const colorControl=document.createElement('label');colorControl.className='color-strength-control';colorControl.innerHTML='色彩影响 <output id="color-strength-value">75%</output><input id="color-strength" type="range" min="0" max="100" step="25" value="75" aria-label="色彩影响程度百分比" title="0、25、50、75、100% 五档，松开后应用">';$('#reveal-color').parentElement.after(colorControl);
 $('#color-strength').oninput=e=>{$('#color-strength-value').textContent=e.target.value+'%';const level=['off','soft','mid','auto','vivid'][Number(e.target.value)/25],target=data.progressive_colors?.[progressivePreset]?.[level];if(target)$('#reveal-color-summary').textContent='松手后应用 → '+colorMusicExplanation(target);};
-$('#color-strength').onchange=e=>{const versions=data.progressive_colors?.[progressivePreset]||{},level=['off','soft','mid','auto','vivid'][Number(e.target.value)/25];if(!versions[level]){e.target.value=['off','soft','mid','auto','vivid'].indexOf(progressiveColor)*25;$('#color-strength-value').textContent=e.target.value+'%';$('#status').textContent='此旧作品尚未生成该色彩强度，请更新作品音乐。';return;}const resume=playing||loading;halt();progressiveColor=level;configure();if(resume)play();};
+$('#color-strength').onchange=e=>{const versions=data.progressive_colors?.[progressivePreset]||{},level=['off','soft','mid','auto','vivid'][Number(e.target.value)/25];if(!versions[level]){e.target.value=['off','soft','mid','auto','vivid'].indexOf(progressiveColor)*25;$('#color-strength-value').textContent=e.target.value+'%';$('#status').textContent='此旧作品尚未生成该色彩强度，请更新作品音乐。';return;}const resume=playing||loading;halt();progressiveColor=level;configure();ensureProgressiveAudio();if(resume)play();};
 const palettePanel=document.createElement('div');palettePanel.id='color-palette';$('#reveal-color-summary').after(palettePanel);
 
 const evidenceLink=document.createElement('a');evidenceLink.href=location.pathname.includes('/works/')?'/showcase/color-evidence.html':'color-evidence.html';evidenceLink.target='_blank';evidenceLink.rel='noopener';evidenceLink.textContent='色彩 A/B 与量化验收 ↗';evidenceLink.className='color-evidence-link';evidenceLink.title='暗部可与冷暖色层重叠；面积统计不要求相加为100%';$('#color-palette').after(evidenceLink);

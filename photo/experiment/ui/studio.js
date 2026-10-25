@@ -34,6 +34,48 @@ let demo = null, demoTimer = null;
 let sampleLoadToken=0,sampleLoading=false;
 const REVISION = 'color52';
 const audioCache = new Map();
+/* ---- H2: on-demand Progressive rendering -------------------------------- */
+/*
+ * The initial build renders only the default Progressive combination
+ * (`nature` / `auto`); every other combination is rendered by the server
+ * when the visitor actually asks for it.  This keeps an upload's audio
+ * footprint at roughly one fifth of the old fan-out.
+ *
+ * `progressiveRendered` mirrors the manifest's `rendered_variants` list.
+ */
+let progressiveRendered = new Set();
+const progressiveKey = (preset, strength) => `${preset} ${strength}`;
+const markRendered = (preset, strength) => progressiveRendered.add(progressiveKey(preset, strength));
+const isRendered = (preset, strength) => progressiveRendered.has(progressiveKey(preset, strength));
+
+function syncRenderedVariants(){
+  progressiveRendered = new Set();
+  const list = (data && data.rendered_variants) || [];
+  for (const entry of list) {
+    if (Array.isArray(entry) && entry.length >= 2) markRendered(entry[0], entry[1]);
+  }
+  // A workspace built before the on-demand renderer existed has every
+  // combination rendered.
+  if (!list.length && data && data.progressive_colors) {
+    for (const [preset, versions] of Object.entries(data.progressive_colors))
+      for (const strength of Object.keys(versions)) markRendered(preset, strength);
+  }
+}
+
+/* The job id is needed to ask the server for a render.  It is embedded in
+ * the manifest as `intake_job` for uploaded works. */
+const jobId = () => (data && (data.intake_job || data.job_id)) || null;
+
+async function requestProgressiveRender(preset, strength){
+  const id = jobId();
+  if (!id) return false;               // a standalone sample: nothing to ask
+  if (isRendered(preset, strength)) return true;
+  const url = `/api/jobs/${id}/progressive?preset=${encodeURIComponent(preset)}&strength=${encodeURIComponent(strength)}`;
+  const response = await fetch(url);
+  if (!response.ok) return false;
+  markRendered(preset, strength);
+  return true;
+}
 
 /* ---- catalog / helpers ------------------------------------------------- */
 const catalog = () => (data && mode === 'soul' ? soulMusic().voice_catalog : data && mode==='progressive' ? musicObj().voice_catalog : data && data.voice_catalog) || [];
@@ -89,6 +131,12 @@ async function play() {
   if (!data || sampleLoading) return;
   if (playing) { halt(); return; }
   if (loading) { halt(); return; }
+  // H2: the selected Progressive combination may not have been rendered
+  // yet.  Ask the server for it before trying to load the audio.
+  if (mode === 'progressive') {
+    const ready = await ensureProgressiveAudio();
+    if (!ready) return;
+  }
   selectedStructure=null;notePinned=false;
   if (offset >= duration()) offset = 0;
   const id = ++token; loading = true;
@@ -373,6 +421,35 @@ function configure() {
   draw();
   trace();
 }
+/* H2: make sure the selected Progressive combination actually has audio.
+ * The initial build only renders `nature` / `auto`; the other
+ * combinations are rendered by the server on demand.  The visitor sees a
+ * short "generating" note while that happens. */
+let progressiveAudioTicket = 0;
+async function ensureProgressiveAudio(){
+  if (mode !== 'progressive' || !data) return true;
+  const preset = progressivePreset, strength = progressiveColor;
+  if (isRendered(preset, strength)) return true;
+  const versions = data.progressive_colors?.[preset];
+  if (!versions || !versions[strength]) return false;   // not offered for this work
+  const ticket = ++progressiveAudioTicket;
+  const status = $('#status');
+  const previous = status ? status.textContent : '';
+  if (status) status.textContent = '正在生成这个风格的音乐…';
+  try {
+    const ok = await requestProgressiveRender(preset, strength);
+    if (ticket !== progressiveAudioTicket) return ok;   // superseded
+    if (ok) {
+      if (status) status.textContent = previous || '音乐已准备好，可以播放。';
+    } else if (status) {
+      status.textContent = '这个风格暂时无法生成，请稍后再试。';
+    }
+    return ok;
+  } catch (e) {
+    if (status) status.textContent = '这个风格暂时无法生成，请稍后再试。';
+    return false;
+  }
+}
 async function load() {
   closeBirthGuide();
   halt(true);
@@ -386,6 +463,7 @@ async function load() {
     const nextData = await r.json();
     if(request!==sampleLoadToken)return;
     soulUserVersion=null;soulUseUser=false;data=nextData;
+    syncRenderedVariants();
     idToPoints = new Map(data.contours.map(p => [p.id, p.points]));
     computeFit();
     document.querySelector('.source').style.aspectRatio = data.width + '/' + data.height;

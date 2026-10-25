@@ -21,7 +21,7 @@ function drawQueue(jobs) {
     const card = document.createElement('article'); card.className='queue-item';
     const img = document.createElement('img'); img.src=job.original; img.alt='收到的图片'; img.loading='lazy';
     const info = document.createElement('div');
-    const title = document.createElement('strong'); title.textContent=`${job.submission === 'phone' ? '手机' : '电脑'} · ${job.id.slice(0,6).toUpperCase()}`;
+    const title = document.createElement('strong'); title.textContent=job.title || `${job.submission === 'phone' ? '手机' : '电脑'} · ${job.id.slice(0,6).toUpperCase()}`;
     const state = document.createElement('p'); state.textContent=(job.provider==='local'?(job.fallback_from?'OpenCV 备用 · ':'历史 OpenCV · '):'豆包 · ')+(job.error || job.music_error || job.stage);
     const date = document.createElement('small'); date.textContent=new Date(job.created_at*1000).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});
     info.append(title,state,date); card.append(img,info);

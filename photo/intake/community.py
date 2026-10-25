@@ -6,6 +6,8 @@ from http.cookies import SimpleCookie
 from urllib.parse import urlsplit, parse_qs
 from PIL import Image, ImageOps
 
+from titles import sanitize_title, TitleError
+
 CATEGORIES = ('music-flow', 'masterpiece')
 ID = re.compile(r'^[a-f0-9]{32}$')
 
@@ -28,15 +30,26 @@ class Community:
             ''')
             db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', ('secret', secrets.token_hex(32)))
             self.secret = db.execute('SELECT value FROM settings WHERE key=?', ('secret',)).fetchone()[0].encode()
-
     @contextmanager
     def connect(self):
-        db = sqlite3.connect(self.db, timeout=15)
+        """Open a SQLite connection in explicit-transaction mode.
+
+        M10 (robustness): the connection used to run with the default
+        `isolation_level=''`, where the driver implicitly opens a
+        transaction before the first write.  `like()` then issued an
+        explicit `BEGIN IMMEDIATE`, which depends on implementation details
+        of the sqlite3 module and can fail with
+        `OperationalError: cannot start a transaction within a transaction`.
+
+        With `isolation_level=None` the driver never opens a transaction on
+        its own; every write path below manages its transaction explicitly
+        with `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK`.
+        """
+        db = sqlite3.connect(self.db, timeout=15, isolation_level=None)
         db.row_factory = sqlite3.Row
         db.execute('PRAGMA foreign_keys=ON')
         try:
-            with db:
-                yield db
+            yield db
         finally:
             db.close()
 
@@ -84,11 +97,26 @@ class Community:
         published = body.get('published', True)
         if type(published) is not bool: raise ValueError('发布状态无效。')
         if not published:
-            with self.connect() as db: db.execute('UPDATE works SET published=0 WHERE id=?', (jid,))
+            with self.connect() as db:
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    db.execute('UPDATE works SET published=0 WHERE id=?', (jid,))
+                    db.execute('COMMIT')
+                except Exception:
+                    db.execute('ROLLBACK')
+                    raise
             return {'published': False}
         title = body.get('title', '')
         category = body.get('category')
-        if not isinstance(title, str) or not 1 <= len(title.strip()) <= 60 or category not in CATEGORIES:
+        # L5 (robustness): the length check alone allowed control characters
+        # and bidirectional overrides, which can corrupt the rendered list
+        # or visually spoof another author's name.  `sanitize_title` applies
+        # the same whitelist as the local rename endpoint.
+        try:
+            title = sanitize_title(title)
+        except TitleError as error:
+            raise ValueError(str(error)) from None
+        if category not in CATEGORIES:
             raise ValueError('请输入 1–60 字作品名，并选择社区模块。')
         if not self.ready(pipeline, jid): raise ValueError('音乐生成完成后才能发布。')
         source = pipeline.runtime / jid
@@ -110,10 +138,16 @@ class Community:
             thumb.replace(target / 'thumbnail.jpg')
             audio.replace(target / 'preview.wav')
             with self.connect() as db:
-                db.execute('''INSERT INTO works VALUES (?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET
-                    title=excluded.title, category=excluded.category,
-                    published_at=CASE WHEN works.published=0 THEN excluded.published_at ELSE works.published_at END,
-                    published=1''', (jid, title.strip(), category, time.time()))
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    db.execute('''INSERT INTO works VALUES (?,?,?,?,1) ON CONFLICT(id) DO UPDATE SET
+                        title=excluded.title, category=excluded.category,
+                        published_at=CASE WHEN works.published=0 THEN excluded.published_at ELSE works.published_at END,
+                        published=1''', (jid, title, category, time.time()))
+                    db.execute('COMMIT')
+                except Exception:
+                    db.execute('ROLLBACK')
+                    raise
         finally:
             thumb.unlink(missing_ok=True)
             audio.unlink(missing_ok=True)
@@ -142,11 +176,16 @@ class Community:
         if not self.visible(pipeline, jid): raise ValueError('作品尚未公开或已撤回。')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            if not db.execute('SELECT 1 FROM works WHERE id=? AND published=1', (jid,)).fetchone():
-                raise ValueError('作品已撤回。')
-            if liked: db.execute('INSERT OR IGNORE INTO likes VALUES (?,?)', (jid, actor))
-            else: db.execute('DELETE FROM likes WHERE work_id=? AND actor=?', (jid, actor))
-            count = db.execute('SELECT COUNT(*) FROM likes WHERE work_id=?', (jid,)).fetchone()[0]
+            try:
+                if not db.execute('SELECT 1 FROM works WHERE id=? AND published=1', (jid,)).fetchone():
+                    raise ValueError('作品已撤回。')
+                if liked: db.execute('INSERT OR IGNORE INTO likes VALUES (?,?)', (jid, actor))
+                else: db.execute('DELETE FROM likes WHERE work_id=? AND actor=?', (jid, actor))
+                count = db.execute('SELECT COUNT(*) FROM likes WHERE work_id=?', (jid,)).fetchone()[0]
+                db.execute('COMMIT')
+            except Exception:
+                db.execute('ROLLBACK')
+                raise
         return {'likes': count, 'liked_by_me': liked}
 
     def route(self, handler, pipeline, guest):
@@ -226,6 +265,9 @@ class Community:
         handler.send_header('X-Content-Type-Options', 'nosniff')
         if action == 'preview': handler.send_header('Accept-Ranges', 'bytes')
         if status == 206: handler.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+        # L4: the same baseline headers as the rest of the console.
+        if hasattr(handler, 'security_headers'):
+            handler.security_headers()
         handler.end_headers()
         try:
             with file.open('rb') as stream:

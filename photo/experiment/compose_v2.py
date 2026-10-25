@@ -17,6 +17,9 @@ from typing import List, Sequence
 
 import numpy as np
 
+from midi_io import write_midi, write_midi_with_mido, vlq  # noqa: F401  (single MIDI implementation)
+from render_soundfont import _write_wav as write_wav  # noqa: F401  (single WAV writer)
+
 try:
     import mido
     HAVE_MIDO = True
@@ -116,116 +119,30 @@ def _add_simple_reverb(audio: np.ndarray, rate: int) -> np.ndarray:
 
 
 def _write_wav(audio: np.ndarray, rate: int, path: Path) -> None:
-    pcm = (audio * 32767.0).astype('<i2').tobytes()
-    with wave.open(str(path), 'wb') as f:
-        f.setnchannels(1)
-        f.setsampwidth(2)
-        f.setframerate(rate)
-        f.writeframes(pcm)
+    """Thin mono wrapper around the shared writer in `render_soundfont`.
+
+    The shared implementation supports arbitrary channel counts; this
+    wrapper keeps the historical mono signature of `compose_v2`.
+    """
+    write_wav(np.asarray(audio, dtype=np.float32), rate, path, channels=1)
 
 
 def export_midi(notes: Sequence[dict], path: Path, tempo_bpm: int = 80) -> None:
-    """Write a multi-channel, multi-program MIDI file via mido (preferred)
-    or a hand-rolled fallback if mido is not installed."""
-    if HAVE_MIDO:
-        _export_mido(notes, path, tempo_bpm)
-    else:
-        _export_fallback(notes, path, tempo_bpm)
+    """Write a multi-channel, multi-program MIDI file.
+
+    Delegates to the single shared implementation in `midi_io.write_midi`
+    (the mido path is kept for callers that explicitly want a Type-1 file).
+    """
+    write_midi(notes, path, tempo_bpm=tempo_bpm)
 
 
 def _export_mido(notes: Sequence[dict], path: Path, tempo_bpm: int) -> None:
-    mid = mido.MidiFile(type=1)
-    track = mido.MidiTrack()
-    mid.tracks.append(track)
-    track.append(mido.MetaMessage('set_tempo',
-                                  tempo=mido.bpm2tempo(tempo_bpm), time=0))
-    # Emit a program change for each voice (channel) that appears.
-    used = sorted({int(n['voice']) for n in notes})
-    programs = {}
-    for ch in used:
-        # pick the first note on this channel to source the program number
-        for n in notes:
-            if int(n['voice']) == ch:
-                programs[ch] = int(n.get('program', 0))
-                break
-    # Pre-scan to collect (channel, program) pairs sorted by time.
-    evs: list = []
-    for n in notes:
-        on = int(round(float(n['start']) * 480))
-        off = int(round((float(n['start']) + float(n['duration'])) * 480))
-        ch = int(n['voice'])
-        pitch = int(n['pitch'])
-        vel = max(1, min(127, int(n.get('velocity', 64))))
-        evs.append((on, 'pc', ch, programs.get(ch, 0), 0))
-        evs.append((on, 'on', ch, pitch, vel))
-        evs.append((off, 'off', ch, pitch, 0))
-    # de-dup program changes (keep first occurrence per channel).
-    seen_pc = set()
-    evs_dedup = []
-    for t, kind, ch, p1, p2 in evs:
-        if kind == 'pc':
-            if ch in seen_pc:
-                continue
-            seen_pc.add(ch)
-        evs_dedup.append((t, kind, ch, p1, p2))
-    evs_dedup.sort(key=lambda e: (e[0], 0 if e[1] == 'pc' else (1 if e[1] == 'on' else 2)))
-    last = 0
-    for t, kind, ch, p1, p2 in evs_dedup:
-        delta = max(0, t - last)
-        last = t
-        if kind == 'pc':
-            track.append(mido.Message('program_change',
-                                      channel=ch, program=p1, time=delta))
-        elif kind == 'on':
-            track.append(mido.Message('note_on',
-                                      channel=ch, note=p1, velocity=p2, time=delta))
-        else:
-            track.append(mido.Message('note_off',
-                                      channel=ch, note=p1, velocity=0, time=delta))
-    track.append(mido.MetaMessage('end_of_track', time=0))
-    mid.save(str(path))
+    """mido-backed Type-1 writer (kept for explicit Type-1 requests)."""
+    write_midi_with_mido(notes, path, tempo_bpm=tempo_bpm)
 
 
 def _export_fallback(notes: Sequence[dict], path: Path, tempo_bpm: int) -> None:
     """Hand-rolled Type-0 MIDI for environments where mido is missing."""
-    def vlq(v):
-        a = [v & 127]
-        v >>= 7
-        while v:
-            a.insert(0, (v & 127) | 128)
-            v >>= 7
-        return bytes(a)
+    write_midi(notes, path, tempo_bpm=tempo_bpm)
 
-    # program changes per channel, only at the very start.
-    pc_by_ch: dict = {}
-    for n in notes:
-        ch = int(n['voice'])
-        pc_by_ch.setdefault(ch, int(n.get('program', 0)))
-    events = []
-    for ch, prog in sorted(pc_by_ch.items()):
-        events.append((0, 'pc', ch, prog, 0))
-    for n in notes:
-        on = int(round(float(n['start']) * 480))
-        off = int(round((float(n['start']) + float(n['duration'])) * 480))
-        ch = int(n['voice'])
-        pitch = int(n['pitch'])
-        vel = max(1, min(127, int(n.get('velocity', 64))))
-        events.append((on, 'on', ch, pitch, vel))
-        events.append((off, 'off', ch, pitch, 0))
-    events.sort(key=lambda e: (e[0], 0 if e[1] == 'pc' else (1 if e[1] == 'on' else 2)))
-    body = bytearray()
-    body += b'\x00\xff\x51\x03'
-    body += struct.pack('>I', int(60_000_000 / tempo_bpm))[1:]
-    last = 0
-    for t, kind, ch, p1, p2 in events:
-        delta = max(0, t - last)
-        last = t
-        if kind == 'pc':
-            body += vlq(delta) + bytes([0xC0 | ch, p1 & 0x7F])
-        elif kind == 'on':
-            body += vlq(delta) + bytes([0x90 | ch, p1 & 0x7F, p2 & 0x7F])
-        else:
-            body += vlq(delta) + bytes([0x80 | ch, p1 & 0x7F, 0])
-    body += b'\x00\xff\x2f\x00'
-    path.write_bytes(b'MThd' + struct.pack('>IHHH', 6, 0, 1, 480)
-                     + b'MTrk' + struct.pack('>I', len(body)) + body)
+

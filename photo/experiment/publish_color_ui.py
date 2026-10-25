@@ -2,6 +2,14 @@
 from pathlib import Path
 import shutil,json,hashlib
 ROOT=Path(__file__).parent
+
+# H3 (correctness): the expected Progressive version used to be a literal
+# here.  It now comes from the engine module, so the assertion can never
+# drift away from what the engine actually produces.
+import sys
+sys.path.insert(0, str(ROOT))
+from progressive_arrangement import VERSION as PROGRESSIVE_VERSION
+
 def publish():
  hashes={n:hashlib.sha256((ROOT/n).read_bytes()).hexdigest() for n in ['color_dna.py','progressive_arrangement.py','progressive_features.py']}
  targets=[ROOT/'dist']
@@ -9,7 +17,7 @@ def publish():
   path=folder/'workspace/studio/sample5.json'
   if not path.exists():continue
   p=json.loads(path.read_text(encoding='utf8'))
-  if p['progressive']['version']!='progressive-color-2.0':raise ValueError('Refresh music first: '+folder.name)
+  if p['progressive']['version']!=PROGRESSIVE_VERSION:raise ValueError('Refresh music first: '+folder.name)
   p['progressive_engine_hashes']=hashes
   if p.get('living_color',{}).get('version')=='four-seasons-1.1':p['living_color']['transition']='2-second visual transitions; auto cues 8/16/24 seconds; timeline scrubbing seeks actual audio offset immediately'
   path.write_text(json.dumps(p,ensure_ascii=False,separators=(',',':')),encoding='utf8')

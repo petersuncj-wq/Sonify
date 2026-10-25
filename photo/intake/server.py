@@ -29,9 +29,52 @@ import numpy as np
 import cv2
 import seedream
 from community import Community
+from titles import sanitize_title, TitleError
 
 MAX_BYTES = 12 * 1024 * 1024
 Image.MAX_IMAGE_PIXELS = 24_000_000
+
+
+class RateLimiter:
+    """Simple sliding-window rate limiter (H6, security).
+
+    The paid Seedream API can be triggered by *any* request that reaches
+    `POST /api/jobs` (or `/api/jobs/batch`).  Without a limit, a single
+    client — or an accidental retry loop — can burn the whole daily quota
+    in seconds.
+
+    The limiter counts requests per client key inside a rolling window and
+    rejects the ones above the budget.  It is intentionally dependency
+    free and degrades gracefully: if anything goes wrong the request is
+    *allowed* (availability beats protection here, and the queue
+    semaphore in `Pipeline.create()` is the hard backstop).
+    """
+
+    def __init__(self, limit: int = 12, window: float = 60.0):
+        self.limit = max(1, int(limit))
+        self.window = float(window)
+        self._hits: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def check(self, key, now=None):
+        """True when the request may proceed."""
+        try:
+            now = time.monotonic() if now is None else now
+            with self._lock:
+                hits = [t for t in self._hits.get(key, []) if now - t < self.window]
+                if len(hits) >= self.limit:
+                    self._hits[key] = hits
+                    return False
+                hits.append(now)
+                self._hits[key] = hits
+                # Opportunistic cleanup so the dict cannot grow forever.
+                if len(self._hits) > 4096:
+                    for stale in [k for k, v in self._hits.items()
+                                  if not v or now - v[-1] >= self.window]:
+                        self._hits.pop(stale, None)
+                return True
+        except Exception:
+            return True
 
 
 class Pipeline:
@@ -44,6 +87,11 @@ class Pipeline:
         self.music_lock = threading.Lock()
         self.jobs = {}
         self.slots = threading.BoundedSemaphore(8)
+        # H2: in-flight on-demand Progressive renders, keyed by
+        # "<job>:<preset>:<strength>".  A lock is created lazily so that
+        # two browsers asking for the same variant wait for one render
+        # instead of starting two.
+        self.pending_variants = {}
         self.share = None
         self.community = Community(self.runtime)
         for file in self.runtime.glob('*/job.json'):
@@ -65,6 +113,19 @@ class Pipeline:
         path = ROOT / 'config.local.json'
         return json.loads(path.read_text(encoding='utf-8-sig')) if path.exists() else {}
 
+    def soul_style(self):
+        """The harmony style used for new Soul compositions (M8).
+
+        `config.local.json` may set `"soul_style": "east"` (default) or
+        `"west"` (functional major-key harmony).  An unknown value is
+        ignored rather than failing the upload, and the reason is logged.
+        """
+        value = str(self.config.get('soul_style', 'east') or 'east').strip().lower()
+        if value not in ('east', 'west'):
+            print(f'[intake] unknown soul_style {value!r}; falling back to "east"', flush=True)
+            return 'east'
+        return value
+
     def availability(self):
         c = self.config
         return {'local': True, 'supplied': True,
@@ -77,9 +138,37 @@ class Pipeline:
             return copy.deepcopy(self.jobs[jid])
 
     def update(self, jid, **values):
+        """Merge `values` into the job record and persist it.
+
+        H5 (robustness): the original implementation let an `OSError` from
+        the disk write escape.  Because `update()` is called from the
+        pipeline's own error handler, a transient disk problem (full disk,
+        file locked by an antivirus scanner, network share hiccup) could
+        turn a *recoverable* failure into an unhandled exception — and the
+        job then stayed in `processing` forever.
+
+        The in-memory record is always updated first (so the API keeps
+        working), and a failing write is logged and retried once.  The
+        write is atomic: the JSON is written to a temporary file and then
+        replaced, so a crash mid-write cannot leave a truncated job file.
+        """
         with self.lock:
             self.jobs[jid].update(values, updated_at=time.time())
-            (self.runtime / jid / 'job.json').write_text(json.dumps(self.jobs[jid], ensure_ascii=False, indent=2), encoding='utf-8')
+            target = self.runtime / jid / 'job.json'
+            payload = json.dumps(self.jobs[jid], ensure_ascii=False, indent=2)
+        for attempt in (0, 1):
+            try:
+                tmp = target.with_suffix('.json.tmp')
+                tmp.write_text(payload, encoding='utf-8')
+                tmp.replace(target)
+                return
+            except OSError:
+                # A transient disk error is worth one retry; after that the
+                # job keeps running from the in-memory record.
+                if attempt:
+                    print(f'[intake] warning: could not persist {target}', flush=True)
+                else:
+                    time.sleep(0.2)
 
     @staticmethod
     def decode(raw):
@@ -128,28 +217,55 @@ class Pipeline:
                 raise ValueError('线稿尺寸或长宽比与原图不符。')
         if not self.slots.acquire(blocking=False):
             raise ValueError('任务队列已满，请稍后再试。')
-        jid = uuid.uuid4().hex
-        folder = self.runtime / jid
-        folder.mkdir()
-        im.save(folder / 'original.png')
-        if lineart_im:
-            lineart_im.save(folder / 'artistic.png')
-        job = dict(id=jid, status='queued', stage='等待处理', created_at=time.time(), provider=provider,
-                   supplied_method=supplied_method if provider == 'supplied' else None,
-                   artistic_requested=bool(artistic or provider == 'supplied'), 
-                   artistic_status='completed' if provider == 'supplied' else ('queued' if artistic else 'disabled'),
-                   original=f'/media/{jid}/original.png', 
-                   structural=f'/media/{jid}/structural.png' if provider == 'supplied' else None,
-                   artistic=f'/media/{jid}/artistic.png' if provider == 'supplied' else None,
-                   geometry=None, handoff=None, error=None, music_status='not_started')
-        if provider == 'seedream':
-            job.update(artistic_requested=True,artistic_status='queued',model=self.config.get('ark_model') or seedream.DEFAULT_MODEL)
-        if guest_owner:
-            job.update(guest_owner=guest_owner, submission='phone')
-        with self.lock:
-            self.jobs[jid] = job
-        self.update(jid)
+        # H5 (robustness): from here on the semaphore is held.  Every exit
+        # path must release it again, otherwise a single failure (disk full,
+        # invalid PNG, pool rejection) permanently burns one of the eight
+        # queue slots and the service eventually stops accepting uploads.
+        try:
+            jid = uuid.uuid4().hex
+            folder = self.runtime / jid
+            folder.mkdir()
+            im.save(folder / 'original.png')
+            if lineart_im:
+                lineart_im.save(folder / 'artistic.png')
+            job = dict(id=jid, status='queued', stage='等待处理', created_at=time.time(), provider=provider,
+                       supplied_method=supplied_method if provider == 'supplied' else None,
+                       artistic_requested=bool(artistic or provider == 'supplied'),
+                       artistic_status='completed' if provider == 'supplied' else ('queued' if artistic else 'disabled'),
+                       original=f'/media/{jid}/original.png',
+                       structural=f'/media/{jid}/structural.png' if provider == 'supplied' else None,
+                       artistic=f'/media/{jid}/artistic.png' if provider == 'supplied' else None,
+                       geometry=None, handoff=None, error=None, music_status='not_started',
+                       title='')
+            if provider == 'seedream':
+                job.update(artistic_requested=True,artistic_status='queued',model=self.config.get('ark_model') or seedream.DEFAULT_MODEL)
+            if guest_owner:
+                job.update(guest_owner=guest_owner, submission='phone')
+            with self.lock:
+                self.jobs[jid] = job
+            self.update(jid)
+        except Exception:
+            self.slots.release()
+            raise
+        # `run()` owns the semaphore from here on and releases it in its
+        # own `finally:` block.
         self.pool.submit(self.run, jid)
+        return self.snapshot(jid)
+
+    def rename(self, jid, title):
+        """Attach a human-readable name to one job and persist it.
+
+        The title is validated against a strict character whitelist: it may
+        contain letters, digits, CJK, spaces and a small set of harmless
+        punctuation marks, but no control characters, no bidirectional
+        override characters (which could spoof the list rendering) and no
+        markup characters.
+        """
+        job = self.snapshot(jid)
+        if not job:
+            raise KeyError(jid)
+        clean = sanitize_title(title)
+        self.update(jid, title=clean)
         return self.snapshot(jid)
 
     def request(self, url, payload=None, headers=None):
@@ -182,7 +298,7 @@ class Pipeline:
             try:
                 with self.music_lock:
                     self.update(jid,stage='正在复用线稿生成音乐')
-                    result=subprocess.run([sys.executable,str(ROOT/'bridge.py'),str(folder)],capture_output=True,timeout=900,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+                    result=subprocess.run([sys.executable,str(ROOT/'bridge.py'),str(folder),self.soul_style()],capture_output=True,timeout=900,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
                 if result.returncode:
                     (folder/'bridge.log').write_bytes(result.stdout+result.stderr)
                     raise ValueError('音乐重新生成未完成，线稿仍已保留。')
@@ -200,6 +316,67 @@ class Pipeline:
                     self.slots.release()
         self.pool.submit(rebuild)
         return self.snapshot(jid)
+
+    def render_progressive(self, jid, preset, strength):
+        """H2: render one Progressive variant on demand.
+
+        The initial build only renders the default combination
+        (`nature` / `auto`).  When a visitor picks another style or
+        colour strength in the studio UI, the browser asks for it here and
+        the server renders just that combination.
+
+        The request is idempotent: an already rendered combination is
+        reported back immediately.  Concurrent requests for the *same*
+        combination share one render (the second one finds the files in
+        place), and requests for *different* combinations are serialised
+        through `music_lock`, because the SoundFont pool and the temporary
+        stem files are shared resources.
+        """
+        job = self.snapshot(jid)
+        folder = self.runtime / jid
+        manifest = folder / 'workspace' / 'studio' / 'sample5.json'
+        if not manifest.is_file():
+            raise ValueError('该作品还没有生成音乐，无法切换风格。')
+        payload = json.loads(manifest.read_text(encoding='utf-8'))
+        colors = payload.get('progressive_colors') or {}
+        if preset not in colors:
+            raise ValueError('未知的音乐风格。')
+        available = colors[preset]
+        if strength not in available:
+            raise ValueError('该作品没有这个色彩强度。')
+        rendered = [tuple(x) for x in payload.get('rendered_variants', [])]
+        if (preset, strength) in rendered:
+            return dict(preset=preset, strength=strength, cached=True)
+        # Guard against two browsers requesting the same variant at once.
+        key = f'{jid}:{preset}:{strength}'
+        with self.lock:
+            pending = self.pending_variants.get(key)
+            if pending is None:
+                pending = self.lock_for_variant(key)
+        try:
+            with self.music_lock:
+                # Re-check: another request may have finished meanwhile.
+                if manifest.is_file():
+                    payload = json.loads(manifest.read_text(encoding='utf-8'))
+                    if (preset, strength) in [tuple(x) for x in payload.get('rendered_variants', [])]:
+                        return dict(preset=preset, strength=strength, cached=True)
+                completed = subprocess.run(
+                    [sys.executable, str(ROOT / 'render_variant.py'), str(folder), preset, strength],
+                    capture_output=True, timeout=900,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                if completed.returncode:
+                    (folder / 'render.log').write_bytes(completed.stdout + completed.stderr)
+                    raise ValueError('这个音乐风格生成失败，请稍后再试。')
+        finally:
+            with self.lock:
+                self.pending_variants.pop(key, None)
+        return dict(preset=preset, strength=strength, cached=False)
+
+    def lock_for_variant(self, key):
+        """Return (and remember) the lock that guards one variant."""
+        lock = threading.Lock()
+        self.pending_variants[key] = lock
+        return lock
 
     def comfy(self, jid):
         c = self.config
@@ -326,7 +503,7 @@ class Pipeline:
                     self.update(jid, stage='等待音乐渲染')
                     with self.music_lock:
                         self.update(jid, stage='正在为三个展示模式编排并渲染音乐')
-                        completed = subprocess.run([sys.executable, str(ROOT / 'bridge.py'), str(folder)],
+                        completed = subprocess.run([sys.executable, str(ROOT / 'bridge.py'), str(folder), self.soul_style()],
                             capture_output=True, timeout=900, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
                     if completed.returncode:
                         (folder / 'bridge.log').write_bytes(completed.stdout + completed.stderr)
@@ -462,6 +639,11 @@ class Share:
 
 
 def make_handler(pipeline, guest=False):
+    # H6 (security): one limiter per listener.  The host console and the
+    # guest upload port have separate budgets, so a guest phone cannot
+    # block the operator and vice versa.
+    limiter = RateLimiter(limit=12, window=60.0)
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             # Pairing tokens and private asset URLs must not enter access logs.
@@ -512,6 +694,38 @@ def make_handler(pipeline, guest=False):
             result['community'] = pipeline.community.state(job['id']) if getattr(pipeline, 'community', None) else None
             return result
 
+        def security_headers(self):
+            """L4 (robustness): baseline browser security headers.
+
+            The console serves private photos and generated works from the
+            same origin, so a missing CSP would turn any XSS into a full
+            data leak.  `frame-ancestors 'self'` blocks clickjacking of
+            the host console; `same-origin` keeps the media/img sources
+            restricted to this server.
+            """
+            self.send_header('Content-Security-Policy',
+                             "default-src 'self'; img-src 'self' data: blob:; "
+                             "media-src 'self' data: blob:; "
+                             "script-src 'self' 'unsafe-inline'; "
+                             "style-src 'self' 'unsafe-inline'; "
+                             "connect-src 'self'; font-src 'self' data:; "
+                             "object-src 'none'; base-uri 'self'; "
+                             "form-action 'self'; frame-ancestors 'self'")
+            self.send_header('X-Frame-Options', 'SAMEORIGIN')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Permissions-Policy', 'geolocation=(), microphone=(), camera=()')
+
+        def rate_key(self):
+            """Identify the caller for rate limiting (H6)."""
+            # The guest session cookie identifies a phone; the loopback
+            # address identifies the host console.
+            owner = self.owner()
+            if owner:
+                return 'guest:' + owner
+            client = self.client_address[0] if self.client_address else 'unknown'
+            return 'ip:' + client
+
         def json_response(self, status, value):
             body = json.dumps(value, ensure_ascii=False).encode()
             self.send_response(status)
@@ -521,6 +735,7 @@ def make_handler(pipeline, guest=False):
                 self.community_cookie = None
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Cache-Control', 'no-store')
+            self.security_headers()
             self.end_headers()
             self.wfile.write(body)
 
@@ -593,6 +808,23 @@ def make_handler(pipeline, guest=False):
                 return self.json_response(200, {'providers': {'local': True} if guest else pipeline.availability(), 'music_adapter': True})
             if path.startswith('/api/jobs/'):
                 parts=path.split('/')
+                # H2: render one Progressive variant on demand.  The studio
+                # UI calls this when the visitor switches to a style or
+                # colour strength that was not pre-rendered.
+                if len(parts) == 5 and parts[4] == 'progressive':
+                    jid = parts[3]
+                    if jid not in pipeline.jobs:
+                        return self.json_response(404, {'error': '作品不存在。'})
+                    if guest and pipeline.snapshot(jid).get('guest_owner') != self.owner():
+                        return self.json_response(403, {'error': '只能操作自己上传的作品。'})
+                    query = parse_qs(urlsplit(self.path).query)
+                    preset = query.get('preset', ['nature'])[0]
+                    strength = query.get('strength', ['auto'])[0]
+                    try:
+                        result = pipeline.render_progressive(jid, preset, strength)
+                    except (ValueError, KeyError, OSError):
+                        return self.json_response(400, {'error': '这个音乐风格暂时无法生成。'})
+                    return self.json_response(202, result)
                 if len(parts)==6 and parts[4]=='soul-roles':
                     try:
                         import role_remix
@@ -697,6 +929,7 @@ def make_handler(pipeline, guest=False):
                 self.send_header('Cache-Control', 'no-store')
                 if status == 206:
                     self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+                self.security_headers()
                 self.end_headers()
                 try:
                     with file.open('rb') as stream:
@@ -717,10 +950,43 @@ def make_handler(pipeline, guest=False):
             self.send_header('Content-Length', str(len(body)))
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Cache-Control', 'no-store')
+            self.security_headers()
             self.end_headers()
             self.wfile.write(body)
 
         def do_PUT(self):
+            # M11: rename a work.  This route is handled *before* the
+            # community router, because the community router only knows
+            # about its own `/api/community/*` endpoints and would
+            # otherwise answer 404.
+            path = unquote(urlsplit(self.path).path)
+            if path.startswith('/api/jobs/') and path.endswith('/title'):
+                parts = path.split('/')
+                if len(parts) != 5:
+                    return self.json_response(404, {'error': '接口不存在。'})
+                jid = parts[3]
+                if jid not in pipeline.jobs:
+                    return self.json_response(404, {'error': '作品不存在。'})
+                # A guest may only rename a work that belongs to its own
+                # session; the host console may rename anything.
+                if guest and pipeline.snapshot(jid).get('guest_owner') != self.owner():
+                    return self.json_response(403, {'error': '只能重命名自己上传的作品。'})
+                length = int(self.headers.get('Content-Length', '0') or 0)
+                if not 0 < length <= 4096:
+                    return self.json_response(400, {'error': '请求大小无效。'})
+                try:
+                    body = json.loads(self.rfile.read(length))
+                except (ValueError, UnicodeDecodeError):
+                    return self.json_response(400, {'error': '请求格式无效。'})
+                if not isinstance(body, dict):
+                    return self.json_response(400, {'error': '请求格式无效。'})
+                try:
+                    job = pipeline.rename(jid, body.get('title', ''))
+                except TitleError as error:
+                    return self.json_response(400, {'error': str(error)})
+                except (KeyError, TypeError, ValueError):
+                    return self.json_response(400, {'error': '请输入 1–60 字作品名。'})
+                return self.json_response(200, self.public_job(job))
             if not (getattr(pipeline, 'community', None) and pipeline.community.route(self, pipeline, guest)):
                 self.json_response(404, {'error': '接口不存在。'})
 
@@ -771,6 +1037,11 @@ def make_handler(pipeline, guest=False):
                 except (ValueError, KeyError, TypeError):
                     return self.json_response(400, {'error': '请选择本机已有的网络地址。'})
             if not guest and self.path == '/api/jobs/batch':
+                # H6 (security): a batch submission can trigger up to five
+                # paid API calls at once.  Rate-limit it like a single
+                # submission so the quota cannot be burned in a burst.
+                if not limiter.check(self.rate_key()):
+                    return self.json_response(429, {'error': '提交过于频繁，请稍后再试。'})
                 try:
                     length=int(self.headers.get('Content-Length','0'))
                     if not 0<length<=MAX_BYTES*7:
@@ -791,6 +1062,11 @@ def make_handler(pipeline, guest=False):
                     return self.json_response(400,{'error':'每批支持1–5张图片，单张最大12 MB。'})
             if self.path != '/api/jobs':
                 return self.json_response(404, {'error': '接口不存在。'})
+            # H6 (security): every submission here can trigger the paid
+            # Seedream API.  Limit the burst rate per client so a stuck
+            # retry loop (or an abusive client) cannot drain the quota.
+            if not limiter.check(self.rate_key()):
+                return self.json_response(429, {'error': '提交过于频繁，请稍后再试。'})
             try:
                 length = int(self.headers.get('Content-Length', '0'))
                 if length <= 0 or length > MAX_BYTES * 8 // 3 + 4096:

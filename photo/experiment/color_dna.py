@@ -3,6 +3,15 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 STRENGTHS={'off':0.,'soft':.25,'mid':.5,'auto':.75,'vivid':1.}
+
+# H3 (correctness): the version string used to be duplicated as a literal
+# in this module, in `photo/intake/upgrade_workspaces.py` and in
+# `publish_color_ui.py`.  When the engine bumped the version to 1.2 the
+# workspace upgrader kept comparing against 1.0, so *every* workspace was
+# considered stale and got rebuilt from scratch on every run.
+#
+# The single source of truth now lives here; every other module imports it.
+VERSION = 'color-dna-1.2'
 def lab_statistics(rgb,linear):
  # sRGB/D65 -> CIELAB. CIE defines measurement, not these product colour roles.
  xyz=linear@np.array([[.4124564,.2126729,.0193339],[.3575761,.7151522,.1191920],[.1804375,.0721750,.9503041]])
@@ -37,7 +46,7 @@ def analyze(image,provenance='original source'):
  warm_share=float((weights*masks['warm']).sum()/max(mass,1e-8));cool_share=float((weights*masks['cool']).sum()/max(mass,1e-8))
  chromatic_regions=sorted([q for q in regions if q['role']!='dark'],key=lambda q:-q['prominence'])
  for q in regions:q['hierarchy']='primary' if q==chromatic_regions[0] else 'secondary' if q['role']!='dark' else 'foundation'
- return dict(lab=lab_statistics(rgb,linear),spatial_order=[r['role'] for r in sorted(regions,key=lambda r:r['centroid'][1]) if r['role']!='dark'],role_method='area × chromatic evidence × centrality; not semantic segmentation',regions=regions,warm_share=round(warm_share,4),cool_share=round(cool_share,4),temperature_contrast=round(2*min(warm_share,cool_share),4),dark_share=round(float((lum<.09).mean()),4),hue=round(hue,4),version='color-dna-1.2',available=available,warmth=round(warm,4) if available else 0.,luminance=round(float(lum.mean()),4),saturation=round(float(s.mean()),4),contrast=round(float(np.quantile(lum,.95)-np.quantile(lum,.05)),4),chromatic_evidence=round(evidence,4),provenance=provenance,reason='' if available else '色彩信息不足，保持几何编曲')
+ return dict(lab=lab_statistics(rgb,linear),spatial_order=[r['role'] for r in sorted(regions,key=lambda r:r['centroid'][1]) if r['role']!='dark'],role_method='area × chromatic evidence × centrality; not semantic segmentation',regions=regions,warm_share=round(warm_share,4),cool_share=round(cool_share,4),temperature_contrast=round(2*min(warm_share,cool_share),4),dark_share=round(float((lum<.09).mean()),4),hue=round(hue,4),version=VERSION,available=available,warmth=round(warm,4) if available else 0.,luminance=round(float(lum.mean()),4),saturation=round(float(s.mean()),4),contrast=round(float(np.quantile(lum,.95)-np.quantile(lum,.05)),4),chromatic_evidence=round(evidence,4),provenance=provenance,reason='' if available else '色彩信息不足，保持几何编曲')
 def expression(color,strength='auto'):
  amount=STRENGTHS.get(strength,.75) if color and color.get('available') else 0.
  c=color or {};warm=c.get('warmth',0);light=c.get('luminance',.5);sat=c.get('saturation',.3);contrast=c.get('contrast',.4)

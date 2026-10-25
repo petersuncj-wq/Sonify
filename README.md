@@ -7,22 +7,22 @@
 
 ## ⚡ 下载即运行（精简版）
 
-> **下载 → 解压 → 进目录 → 装依赖 → 启动。** zip 约 303 MB，解压后约 574 MB。
+> **下载 → 解压 → 进目录 → 装依赖 → 启动。** zip 约 304 MB，解压后约 578 MB。
 
-**下载：** 打开 Release → **拉到页面最底部** → **Assets** → 点击 **`Sonify-Runnable-20261018.zip`**（302.6 MB）。
+**下载：** 打开 Release → **拉到页面最底部** → **Assets** → 点击 **`Sonify-Runnable-20261025.zip`**（约 304 MB）。
 ⚠️ **不要**用绿色 **Code → Download ZIP**（那只有源码，没有音源/长卷/Paint 资源，不能直接跑）。
 
-Release：https://github.com/petersuncj-wq/Sonify/releases/tag/v1.0-runnable
+Release：https://github.com/DClovewatch-deville/Sonify1.1/releases/tag/v1.1-runnable
 
 ```powershell
 # 1. 解压后进入目录（必须）
-cd "D:\你解压的位置\Sonify-Runnable-20261018"
+cd "D:\你解压的位置\Sonify-Runnable-20261025"
 
 # 2. 安装依赖（只需一次；国内建议保留镜像）
-py -3.12 -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -m pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 
 # 3. 启动
-py -3.12 start_sonify.py --port 8895
+python start_sonify.py --port 8895
 ```
 
 打开 **http://127.0.0.1:8895/**（以控制台打印的“主页”为准）。停止：**Ctrl + C**。
@@ -69,7 +69,7 @@ copy photo\intake\config.example.json photo\intake\config.local.json
 ## 下载即运行
 
 > 安装与启动步骤已移到文首 **[⚡ 下载即运行](#-下载即运行精简版)**。
-> Release：https://github.com/petersuncj-wq/Sonify/releases/tag/v1.0-runnable
+> Release：https://github.com/DClovewatch-deville/Sonify1.1/releases/tag/v1.1-runnable
 
 ---
 

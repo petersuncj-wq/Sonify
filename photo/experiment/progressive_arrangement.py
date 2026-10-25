@@ -3,6 +3,15 @@ from copy import deepcopy
 import hashlib,math
 import progressive_features as pf
 from color_dna import expression,labels as color_labels
+
+# H3 (correctness): the version string was duplicated as a literal in this
+# module, in `publish_color_ui.py` and in the reference snapshots.  Bumping
+# the engine without updating the assertion in `publish_color_ui.py` broke
+# the colour-UI publish step with "Refresh music first".
+#
+# The single source of truth now lives here.
+VERSION = 'progressive-color-2.0'
+
 PRESETS={
  'nature':dict(name='东方自然',programs=[73,10,42,88,48]),
  'chamber':dict(name='西洋小型交响',programs=[40,0,42,48,49]),
@@ -182,4 +191,4 @@ def arrange(soul,preset='nature',units=None,color_dna=None,color_strength='auto'
    if preset=='nature':instruments[preset]=['长笛' if reflective else '排箫','竖琴','大提琴','暖色 Pad' if reflective else '弦乐','弦乐' if reflective else '长笛']
    elif preset=='chamber':instruments[preset]=['单簧管' if reflective else '小提琴','钢琴' if reflective else '竖琴','大提琴','弦乐','长笛']
  for v,c in enumerate(catalog):c.update(name_zh=labels[v],program=style['programs'][v],instrument=instruments[preset][v])
- return dict(notes=sorted(accepted,key=lambda n:(n['start'],n['voice'],n['pitch'])),duration=36.,tempo=120,phases=[dict(start=i*6,end=(i+1)*6,label=f'Chapter {i+1}',roles=['melody','column','support','loop','accompany']) for i in range(6)],voice_catalog=catalog,color_dna=color_dna,color_labels=color_labels(color_dna),color_strength=color_strength,version='progressive-color-2.0',preset=preset,preset_name=style['name'],emotions=[dict(id=i,label=l,start=a,end=b) for i,l,a,b in EMOTIONS],mix_gains=mix,spatial_pan=[-.12,.28,-.12,-.28,.35],theme=[dict(source=n['source'],pitch=n['pitch'],source_point=n['source_point']) for n in theme],features=F,arrangement_params=dna,key_pc=key,scale_pcs=scale,geometry_key_pc=geometry_key,source_method='arc-spaced vertices of principal source contour')
+ return dict(notes=sorted(accepted,key=lambda n:(n['start'],n['voice'],n['pitch'])),duration=36.,tempo=120,phases=[dict(start=i*6,end=(i+1)*6,label=f'Chapter {i+1}',roles=['melody','column','support','loop','accompany']) for i in range(6)],voice_catalog=catalog,color_dna=color_dna,color_labels=color_labels(color_dna),color_strength=color_strength,version=VERSION,preset=preset,preset_name=style['name'],emotions=[dict(id=i,label=l,start=a,end=b) for i,l,a,b in EMOTIONS],mix_gains=mix,spatial_pan=[-.12,.28,-.12,-.28,.35],theme=[dict(source=n['source'],pitch=n['pitch'],source_point=n['source_point']) for n in theme],features=F,arrangement_params=dna,key_pc=key,scale_pcs=scale,geometry_key_pc=geometry_key,source_method='arc-spaced vertices of principal source contour')

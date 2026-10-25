@@ -5,6 +5,10 @@ ROOT=Path(__file__).parent;sys.path.insert(0,str(ROOT/'vendor'))
 import numpy as np
 from color_dna import analyze
 from progressive_arrangement import arrange
+# L3: the archived reference snapshots now live in `_archive/` so that
+# they cannot be mistaken for production modules (and so that they are
+# excluded from the engine hash allow-list).
+sys.path.insert(0, str(ROOT / '_archive'))
 from progressive_arrangement_v10_reference import arrange as old_arrange
 from color_dna_v10_reference import analyze as old_analyze
 from progressive_arrangement_v14_reference import arrange as layered_arrange
